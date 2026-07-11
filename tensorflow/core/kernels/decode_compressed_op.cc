@@ -120,11 +120,28 @@ class DecodeCompressedOp : public OpKernel {
           /*output_buffer_bytes=*/static_cast<size_t>(kBufferSize),
           zlib_options);
 
-      absl::Status result = zlib_stream.ReadNBytes(INT_MAX, &output);
+      // Cap decompressed size at 1GB, matching the limit enforced on the
+      // ZSTD branch below, to prevent a small, highly-compressible
+      // "decompression bomb" input from forcing an unbounded in-memory
+      // allocation (up to INT_MAX bytes per input element, with no check on
+      // the input:output size ratio).
+      constexpr int64_t kMaxDecompressedBytes = 1024 * 1024 * 1024;  // 1GB
+      absl::Status result =
+          zlib_stream.ReadNBytes(kMaxDecompressedBytes, &output);
 
-      // ReadNBytes returns OutOfRange for EOF. Swallow it and return OkStatus,
-      // since we're reading INT_MAX bytes anyway.
+      // ReadNBytes returns OutOfRange for EOF, which is the expected/legit
+      // case when the decompressed data is smaller than the cap. Swallow it
+      // and return OkStatus.
       if (absl::IsOutOfRange(result)) return absl::OkStatus();
+
+      // If we read exactly up to the cap without hitting EOF, the input was
+      // either legitimately larger than the cap or a decompression bomb;
+      // reject it rather than silently truncating.
+      if (result.ok() &&
+          output.size() >= static_cast<size_t>(kMaxDecompressedBytes)) {
+        return absl::InvalidArgumentError(
+            "Decompressed size exceeds 1GB limit");
+      }
 
       return result;
     }
